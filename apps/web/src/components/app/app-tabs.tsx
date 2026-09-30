@@ -21,12 +21,11 @@ import { usePoll } from '@/lib/use-poll';
  *
  * The Inbox tab carries a dot while the inbox holds items not seen yet (lib/inbox, #279).
  *
- * On phones the five pills are wider than the strip (#473): the active pill can land off-screen
- * on load, and with it the only unread signal in the app. Below `sm` the pills go icon-only to
- * buy back width, the active pill is scrolled into view on every route change, edge-fade masks
- * show only while the strip actually overflows, and the unread dot mirrors onto Home (always the
- * first, always-visible pill) so it's never scrolled out of sight. Desktop is untouched: it never
- * overflows, so none of this fires there.
+ * On phones the pills are wider than the strip (#473), so below `sm` they go icon-only (the
+ * label stays for screen readers), the strip scrolls the active pill into view on every route
+ * change (the strip only, never the page), edge fades show while more pills sit past an edge,
+ * and the unread dot is mirrored onto Home, the first pill, so it can't be scrolled out of
+ * sight. From `sm` up the row never overflows and looks as it always did.
  */
 const TABS = [
   { href: '/app', key: 'appTabs.home', icon: Home, exact: true, cashable: false },
@@ -41,11 +40,13 @@ const TABS = [
 /** How often the dot re-checks the inbox; the reads ride the shared event windows. */
 const UNREAD_POLL_MS = 60_000;
 
+/** The edge fades' width (`w-8`): a pill scrolled into view clears it. */
+const FADE_PX = 32;
+
 /** Unread inbox items for the signed-in wallet; 0 the moment the inbox is marked read. */
 function useInboxUnread(): number {
   const me = useWallet().profile?.address;
   const [unread, setUnread] = useState(0);
-
   usePoll(
     async (signal) => {
       if (!me) return setUnread(0);
@@ -55,17 +56,15 @@ function useInboxUnread(): number {
     UNREAD_POLL_MS,
     me,
   );
-
   useEffect(() => {
     const cleared = () => setUnread(0);
     window.addEventListener(INBOX_READ_EVENT, cleared);
     return () => window.removeEventListener(INBOX_READ_EVENT, cleared);
   }, []);
-
   return unread;
 }
 
-/** Tracks whether the strip has more content past its left/right edge right now. */
+/** Whether the strip has more pills past its left / right edge right now. */
 function useEdgeOverflow(scrollRef: RefObject<HTMLDivElement | null>) {
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
@@ -81,18 +80,35 @@ function useEdgeOverflow(scrollRef: RefObject<HTMLDivElement | null>) {
     const el = scrollRef.current;
     if (!el) return;
     measure();
-
     el.addEventListener('scroll', measure, { passive: true });
-    const resizeObserver = new ResizeObserver(measure);
-    resizeObserver.observe(el);
-
+    // Rotation or a resized window changes what fits.
+    const resize = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    resize?.observe(el);
     return () => {
       el.removeEventListener('scroll', measure);
-      resizeObserver.disconnect();
+      resize?.disconnect();
     };
-  }, [measure]);
+  }, [measure, scrollRef]);
 
-  return { canScrollLeft, canScrollRight };
+  return { canScrollLeft, canScrollRight, measure };
+}
+
+/**
+ * Scroll `strip` sideways just enough that `pill` is fully visible and clear of the edge
+ * fades. Unlike scrollIntoView this never scrolls the page, which would jump to the tab bar
+ * on a phone where it sits below the fold. Instant under reduced motion.
+ */
+function revealInStrip(strip: HTMLElement, pill: HTMLElement) {
+  const s = strip.getBoundingClientRect();
+  const p = pill.getBoundingClientRect();
+  let delta = 0;
+  if (p.left < s.left + FADE_PX) delta = p.left - s.left - FADE_PX;
+  else if (p.right > s.right - FADE_PX) delta = p.right - s.right + FADE_PX;
+  // Clamped to the scroll range: nothing to do for a pill already clear of the fades.
+  const next = Math.max(0, Math.min(strip.scrollWidth - strip.clientWidth, strip.scrollLeft + delta));
+  if (next === strip.scrollLeft) return;
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  strip.scrollTo({ left: next, behavior: reduced ? 'auto' : 'smooth' });
 }
 
 export function AppTabs() {
@@ -100,22 +116,17 @@ export function AppTabs() {
   const pathname = usePathname();
   const tabs = TABS.filter((tab) => !tab.cashable || !FOCUS_MODE);
   const unread = useInboxUnread();
-
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef<HTMLAnchorElement>(null);
-  const { canScrollLeft, canScrollRight } = useEdgeOverflow(scrollRef);
+  const { canScrollLeft, canScrollRight, measure } = useEdgeOverflow(scrollRef);
 
-  // Keep the active pill on-screen whenever the route changes, including on
-  // first load — a direct hit on /app/inbox or /app/people must not leave
-  // its own pill (or, for inbox, the only unread signal) off-screen (#473).
+  // A direct hit on /app/inbox or /app/people must not leave its own pill off-screen (#473).
   useEffect(() => {
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    activeRef.current?.scrollIntoView({
-      inline: 'nearest',
-      block: 'nearest',
-      behavior: reducedMotion ? 'auto' : 'smooth',
-    });
-  }, [pathname]);
+    if (scrollRef.current && activeRef.current) revealInStrip(scrollRef.current, activeRef.current);
+    measure();
+  }, [pathname, measure]);
+
+  const onInbox = pathname.startsWith('/app/inbox');
 
   return (
     <nav className="sticky top-16 z-30 -mx-4 border-b border-border/50 bg-background/70 px-4 py-2 backdrop-blur-xl">
@@ -127,10 +138,10 @@ export function AppTabs() {
           {tabs.map((tab) => {
             const active = tab.exact ? pathname === tab.href : pathname.startsWith(tab.href);
             const Icon = tab.icon;
-            const dot =
-              (tab.href === '/app/inbox' && unread > 0 && !active) ||
-              (tab.href === '/app' && unread > 0);
-
+            const dot = tab.href === '/app/inbox' && unread > 0 && !active;
+            // Phones only: Home is always on-screen, so it repeats the Inbox dot (the one
+            // screen readers hear stays on Inbox).
+            const mirror = tab.href === '/app' && unread > 0 && !onInbox;
             return (
               <Link
                 key={tab.href}
@@ -151,22 +162,29 @@ export function AppTabs() {
                     <span className="sr-only">{t('appTabs.inboxUnread')}</span>
                   </span>
                 )}
+                {mirror && (
+                  <span
+                    data-testid="inbox-dot-mirror"
+                    aria-hidden
+                    className="absolute right-1.5 top-1.5 size-2 rounded-full bg-primary sm:hidden"
+                  />
+                )}
               </Link>
             );
           })}
         </div>
-
-        {/* Edge fades: overflow-driven, so they only ever appear where the strip actually
-            scrolls — and only below sm, since the desktop row never overflows (#473). */}
+        {/* Edge fades: only where the strip really scrolls, and never from sm up. */}
         <div
-          aria-hidden="true"
+          aria-hidden
+          data-testid="tabs-fade-left"
           className={cn(
             'pointer-events-none absolute inset-y-0 left-0 w-8 bg-gradient-to-r from-background to-transparent transition-opacity sm:hidden',
             canScrollLeft ? 'opacity-100' : 'opacity-0',
           )}
         />
         <div
-          aria-hidden="true"
+          aria-hidden
+          data-testid="tabs-fade-right"
           className={cn(
             'pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent transition-opacity sm:hidden',
             canScrollRight ? 'opacity-100' : 'opacity-0',
