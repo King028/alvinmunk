@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Home, Star, Target, Coins, Activity, Users, Bell } from 'lucide-react';
@@ -20,6 +20,13 @@ import { usePoll } from '@/lib/use-poll';
  * until the core vouch loop is proven (belts/08).
  *
  * The Inbox tab carries a dot while the inbox holds items not seen yet (lib/inbox, #279).
+ *
+ * On phones the five pills are wider than the strip (#473): the active pill can land off-screen
+ * on load, and with it the only unread signal in the app. Below `sm` the pills go icon-only to
+ * buy back width, the active pill is scrolled into view on every route change, edge-fade masks
+ * show only while the strip actually overflows, and the unread dot mirrors onto Home (always the
+ * first, always-visible pill) so it's never scrolled out of sight. Desktop is untouched: it never
+ * overflows, so none of this fires there.
  */
 const TABS = [
   { href: '/app', key: 'appTabs.home', icon: Home, exact: true, cashable: false },
@@ -38,6 +45,7 @@ const UNREAD_POLL_MS = 60_000;
 function useInboxUnread(): number {
   const me = useWallet().profile?.address;
   const [unread, setUnread] = useState(0);
+
   usePoll(
     async (signal) => {
       if (!me) return setUnread(0);
@@ -47,12 +55,44 @@ function useInboxUnread(): number {
     UNREAD_POLL_MS,
     me,
   );
+
   useEffect(() => {
     const cleared = () => setUnread(0);
     window.addEventListener(INBOX_READ_EVENT, cleared);
     return () => window.removeEventListener(INBOX_READ_EVENT, cleared);
   }, []);
+
   return unread;
+}
+
+/** Tracks whether the strip has more content past its left/right edge right now. */
+function useEdgeOverflow(scrollRef: RefObject<HTMLDivElement | null>) {
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const measure = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 1);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1);
+  }, [scrollRef]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    measure();
+
+    el.addEventListener('scroll', measure, { passive: true });
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(el);
+
+    return () => {
+      el.removeEventListener('scroll', measure);
+      resizeObserver.disconnect();
+    };
+  }, [measure]);
+
+  return { canScrollLeft, canScrollRight };
 }
 
 export function AppTabs() {
@@ -61,35 +101,77 @@ export function AppTabs() {
   const tabs = TABS.filter((tab) => !tab.cashable || !FOCUS_MODE);
   const unread = useInboxUnread();
 
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const activeRef = useRef<HTMLAnchorElement>(null);
+  const { canScrollLeft, canScrollRight } = useEdgeOverflow(scrollRef);
+
+  // Keep the active pill on-screen whenever the route changes, including on
+  // first load — a direct hit on /app/inbox or /app/people must not leave
+  // its own pill (or, for inbox, the only unread signal) off-screen (#473).
+  useEffect(() => {
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    activeRef.current?.scrollIntoView({
+      inline: 'nearest',
+      block: 'nearest',
+      behavior: reducedMotion ? 'auto' : 'smooth',
+    });
+  }, [pathname]);
+
   return (
     <nav className="sticky top-16 z-30 -mx-4 border-b border-border/50 bg-background/70 px-4 py-2 backdrop-blur-xl">
-      <div className="flex gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {tabs.map((tab) => {
-          const active = tab.exact ? pathname === tab.href : pathname.startsWith(tab.href);
-          const Icon = tab.icon;
-          const dot = tab.href === '/app/inbox' && unread > 0 && !active;
-          return (
-            <Link
-              key={tab.href}
-              href={tab.href}
-              aria-current={active ? 'page' : undefined}
-              className={cn(
-                'relative inline-flex shrink-0 items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-colors',
-                active
-                  ? 'bg-primary/15 text-foreground ring-1 ring-inset ring-primary/30'
-                  : 'text-muted-foreground hover:bg-muted hover:text-foreground',
-              )}
-            >
-              <Icon className={cn('size-4', active ? 'text-primary' : '')} />
-              {t(tab.key)}
-              {dot && (
-                <span data-testid="inbox-dot" className="absolute right-2 top-2 size-2 rounded-full bg-primary">
-                  <span className="sr-only">{t('appTabs.inboxUnread')}</span>
-                </span>
-              )}
-            </Link>
-          );
-        })}
+      <div className="relative">
+        <div
+          ref={scrollRef}
+          className="flex gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
+          {tabs.map((tab) => {
+            const active = tab.exact ? pathname === tab.href : pathname.startsWith(tab.href);
+            const Icon = tab.icon;
+            const dot =
+              (tab.href === '/app/inbox' && unread > 0 && !active) ||
+              (tab.href === '/app' && unread > 0);
+
+            return (
+              <Link
+                key={tab.href}
+                ref={active ? activeRef : undefined}
+                href={tab.href}
+                aria-current={active ? 'page' : undefined}
+                className={cn(
+                  'relative inline-flex shrink-0 items-center gap-2 rounded-full px-3 py-2 text-sm font-medium transition-colors sm:px-4',
+                  active
+                    ? 'bg-primary/15 text-foreground ring-1 ring-inset ring-primary/30'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                )}
+              >
+                <Icon className={cn('size-4', active ? 'text-primary' : '')} />
+                <span className="sr-only sm:not-sr-only">{t(tab.key)}</span>
+                {dot && (
+                  <span data-testid="inbox-dot" className="absolute right-2 top-2 size-2 rounded-full bg-primary">
+                    <span className="sr-only">{t('appTabs.inboxUnread')}</span>
+                  </span>
+                )}
+              </Link>
+            );
+          })}
+        </div>
+
+        {/* Edge fades: overflow-driven, so they only ever appear where the strip actually
+            scrolls — and only below sm, since the desktop row never overflows (#473). */}
+        <div
+          aria-hidden="true"
+          className={cn(
+            'pointer-events-none absolute inset-y-0 left-0 w-8 bg-gradient-to-r from-background to-transparent transition-opacity sm:hidden',
+            canScrollLeft ? 'opacity-100' : 'opacity-0',
+          )}
+        />
+        <div
+          aria-hidden="true"
+          className={cn(
+            'pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent transition-opacity sm:hidden',
+            canScrollRight ? 'opacity-100' : 'opacity-0',
+          )}
+        />
       </div>
     </nav>
   );
